@@ -1,3 +1,3 @@
 # hello-world
 a first testing repository
-I am chemist loving programming a lot:)
+I am a chemist who loves programming a lot:)
