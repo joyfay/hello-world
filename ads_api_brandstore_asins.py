@@ -125,9 +125,23 @@ ENDPOINTS: dict[str, dict[str, Any]] = {
 
 ASIN_RE = re.compile(r"^(?:B0[A-Z0-9]{8}|\d{10})$")
 
-# Keys whose values are ASINs, and keys that name the component we are inside.
-ASIN_KEYS = {"asin", "asins", "asinlist", "productasin", "asinid", "itemasin"}
+# Keys whose values are ASINs. `productAsins` is the one the live API actually
+# uses — every widget reaches its products through it:
+#   widgets[N].storeProductGridWidget.content.productAsins[]
+#   widgets[N].storeTileWidget.tiles[N].storeProductTile.content.productAsins[]
+#   widgets[N].storeShoppableImageWidget.tiles[N].content.points[N].productAsins[]
+#   widgets[N].storeProductCollectionWidget.tiles[N]
+#                                   .storeProductCollectionASINGrid.productAsins[]
+# The rest are kept as cheap insurance against widgets not seen yet.
+ASIN_KEYS = {"productasins", "asin", "asins", "asinlist", "productasin",
+             "asinid", "itemasin", "productasinlist"}
+
 TYPE_KEYS = ("componenttype", "widgettype", "moduletype", "type", "name")
+
+# The content tree names its components structurally rather than in a type
+# field — `storeProductGridWidget` is the key, not a value — so the enclosing
+# key is the only component label most rows will ever get.
+COMPONENT_KEY_RE = re.compile(r"(Widget|Tile|Grid)$")
 
 # A component whose type matches any of these picks its own products at render
 # time, so whatever ASINs it does return are illustrative, not exhaustive.
@@ -314,7 +328,11 @@ def extract_asins(node: Any, path: str = "", component: str = "") -> Iterator[tu
             if key.lower() in ASIN_KEYS:
                 yield from _asins_from(value, current, child_path)
             else:
-                yield from extract_asins(value, child_path, current)
+                # A key like `storeProductGridWidget` names the component its
+                # subtree belongs to; an explicit type field deeper down still
+                # wins, since it is more specific.
+                child_component = key if COMPONENT_KEY_RE.search(key) else current
+                yield from extract_asins(value, child_path, child_component)
 
     elif isinstance(node, list):
         for i, item in enumerate(node):
@@ -410,29 +428,45 @@ def run(client: Client, store_name: str | None, store_id: str | None,
     titles = {p["tag"]: p.get("title", "") for p in page_infos}
     page_ids = [p["tag"] for p in page_infos]
 
+    returned: set[str] = set()
+
     for start in range(0, len(page_ids), batch_size):
         batch = page_ids[start:start + batch_size]
         label = f"{start // batch_size + 1}"
         print(f"pages {start + 1}-{start + len(batch)} of {len(page_ids)} ...",
               file=sys.stderr, flush=True)
 
-        data = client.call(
-            ENDPOINTS["pages"],
-            {"store_id": sid, "edition_id": edition_id, "publish_id": publish_id,
-             "page_ids": batch, "page_ids_label": label},
-            tag="pages",
-        )
+        subs = {"store_id": sid, "edition_id": edition_id, "publish_id": publish_id,
+                "page_ids": batch, "page_ids_label": label}
+        spec = dict(ENDPOINTS["pages"])
+        token = None
+        token_key = spec.get("next_token_key", "nextToken")
 
-        for page in _items(data, ENDPOINTS["pages"]["items_key"]):
-            pid = page.get("pageId", "")
-            seen: set[tuple[str, str]] = set()
-            for asin, component, path in extract_asins(page.get("content", page)):
-                if (asin, component) in seen:
-                    continue
-                seen.add((asin, component))
-                rows.append(Row(sid, sname, pid, titles.get(pid, ""), component,
-                                path, asin, _is_dynamic(component)))
-            print(f"    {titles.get(pid, pid)}: {len(seen)} ASINs", file=sys.stderr)
+        # Keep pulling while the service offers a continuation. Without this a
+        # store with more pages than one response holds is silently truncated,
+        # which reads exactly like "those pages have no products".
+        while True:
+            if token:
+                spec = dict(spec)
+                spec["body"] = {**spec.get("body", {}), token_key: token}
+            data = client.call(spec, subs, tag="pages")
+
+            for page in _items(data, ENDPOINTS["pages"]["items_key"]):
+                pid = page.get("pageId", "")
+                returned.add(pid)
+                seen: set[tuple[str, str]] = set()
+                for asin, component, path in extract_asins(page.get("content", page)):
+                    if (asin, component) in seen:
+                        continue
+                    seen.add((asin, component))
+                    rows.append(Row(sid, sname, pid, titles.get(pid, ""), component,
+                                    path, asin, _is_dynamic(component)))
+                print(f"    {titles.get(pid) or pid}: {len(seen)} ASINs", file=sys.stderr)
+
+            token = data.get(token_key)
+            if not token:
+                break
+            print(f"    ... continuing ({token_key})", file=sys.stderr)
 
         time.sleep(0.5)
 
@@ -448,8 +482,28 @@ def run(client: Client, store_name: str | None, store_id: str | None,
 
     distinct = {r.asin for r in rows}
     dynamic = {r.asin for r in rows if r.dynamic}
-    print(f"\n{len(distinct)} distinct ASINs across {len(page_ids)} pages -> {out_path}",
+    print(f"\n{len(distinct)} distinct ASINs -> {out_path}", file=sys.stderr)
+
+    # Coverage is the thing most likely to be quietly wrong, so state it rather
+    # than letting a partial pull pass for a complete one.
+    asked, unexpected = set(page_ids), returned - set(page_ids)
+    missing = asked - returned
+    print(f"pages: asked for {len(asked)}, got content for {len(returned & asked)}",
           file=sys.stderr)
+    if unexpected:
+        print(f"  {len(unexpected)} page(s) came back that were NOT requested — the "
+              f"pageId filter is not constraining the query:", file=sys.stderr)
+        for pid in sorted(unexpected):
+            print(f"      {pid}", file=sys.stderr)
+    if missing:
+        print(f"  {len(missing)} requested page(s) returned nothing:", file=sys.stderr)
+        for pid in sorted(missing)[:15]:
+            print(f"      {titles.get(pid) or pid}", file=sys.stderr)
+        if len(missing) > 15:
+            print(f"      ... and {len(missing) - 15} more", file=sys.stderr)
+        print("  Those pages are absent from the DRAFT edition, or the query is "
+              "being truncated. Check a raw pages_*.json for a continuation token "
+              "or a total count before treating this as complete.", file=sys.stderr)
     if dynamic:
         print(f"{len(dynamic)} came from dynamic components — those lists are "
               f"illustrative, not complete.", file=sys.stderr)
