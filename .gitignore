@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# scraper / API client output
+raw/
+*.csv
