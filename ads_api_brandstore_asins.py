@@ -92,17 +92,32 @@ ENDPOINTS: dict[str, dict[str, Any]] = {
     "publish_versions": {
         "method": "POST",
         "path": "/adsApi/v1/query/brandStoreEditionPublishVersions",
-        "body": {"storeId": "$store_id", "editionId": "$edition_id"},
+        # The query endpoints wrap every filter as {"<field>Filter": {"include": [...]}}.
+        # publishStatusFilter accepts DRAFT and nothing else: asking for
+        # PUBLISHED or REVIEW_IN_PROGRESS returns
+        #   400 {"message":"Only DRAFT status query is supported"}
+        # so what comes back describes the DRAFT edition, which can differ from
+        # what shoppers currently see if changes are staged but unpublished.
+        "body": {
+            "storeIdFilter": {"include": ["$store_id"]},
+            "editionIdFilter": {"include": ["$edition_id"]},
+            "publishStatusFilter": {"include": ["DRAFT"]},
+            "maxResults": 50,
+        },
         "items_key": "brandStoreEditionPublishVersions",
     },
     "pages": {
         "method": "POST",
         "path": "/adsApi/v1/query/brandStorePages",
+        # Same filter-envelope convention. Filters that resolve to nothing are
+        # pruned before sending, so a missing publish id drops its filter rather
+        # than sending {"include": [null]}.
         "body": {
-            "storeId": "$store_id",
-            "editionId": "$edition_id",
-            "storeEditionPublishId": "$publish_id",
-            "pageIds": "$page_ids",
+            "storeIdFilter": {"include": ["$store_id"]},
+            "editionIdFilter": {"include": ["$edition_id"]},
+            "pageIdFilter": {"include": "$page_ids"},
+            "storeEditionPublishIdFilter": {"include": ["$publish_id"]},
+            "maxResults": 50,
         },
         "items_key": "brandStorePages",
     },
@@ -192,7 +207,7 @@ class Client:
         headers.update(spec.get("headers", {}))
 
         params = _substitute(spec.get("query", {}), subs) or None
-        body = _substitute(spec.get("body", {}), subs) if method != "GET" else None
+        body = _prune(_substitute(spec.get("body", {}), subs)) if method != "GET" else None
 
         for attempt in range(5):
             resp = requests.request(
@@ -239,6 +254,25 @@ def _substitute(template: Any, subs: dict[str, Any]) -> Any:
     if isinstance(template, list):
         return [_substitute(v, subs) for v in template]
     return template
+
+
+def _prune(node: Any) -> Any:
+    """Drop unfilled placeholders so empty filters are omitted, not sent as null.
+
+    A filter whose values did not resolve — `{"include": [None]}` — is rejected
+    by the API, whereas leaving the filter out entirely means "no constraint".
+    """
+    if isinstance(node, dict):
+        cleaned = {}
+        for key, value in node.items():
+            value = _prune(value)
+            if value is None or value == [] or value == {}:
+                continue
+            cleaned[key] = value
+        return cleaned
+    if isinstance(node, list):
+        return [v for v in (_prune(v) for v in node) if v is not None]
+    return node
 
 
 def _items(payload: dict, key: str) -> list:
@@ -347,8 +381,9 @@ def run(client: Client, store_name: str | None, store_id: str | None,
     edition_id = editions[0].get("editionId", "default")
     print(f"edition: {edition_id}", file=sys.stderr)
 
-    # The published version is what shoppers actually see. If this endpoint is
-    # unavailable, keep going — some deployments accept a page query without it.
+    # Only DRAFT versions are queryable — the service rejects any other status
+    # outright. So this identifies the draft, not the live page, and the two
+    # differ whenever edits are staged but not yet published.
     publish_id = None
     try:
         versions = _items(
@@ -356,12 +391,18 @@ def run(client: Client, store_name: str | None, store_id: str | None,
                         {"store_id": sid, "edition_id": edition_id}, tag="publish_versions"),
             ENDPOINTS["publish_versions"]["items_key"],
         )
-        published = [v for v in versions
-                     if str(v.get("status", "")).upper() in ("PUBLISHED", "LIVE", "ACTIVE")]
-        chosen = (published or versions or [None])[0]
-        if chosen:
-            publish_id = chosen.get("storeEditionPublishId") or chosen.get("publishId")
-        print(f"publish version: {publish_id}", file=sys.stderr)
+        if versions:
+            chosen = versions[0]
+            publish_id = (chosen.get("storeEditionPublishId")
+                          or chosen.get("publishId") or chosen.get("id"))
+            status = chosen.get("publishStatus") or chosen.get("status") or "DRAFT"
+            print(f"publish version: {publish_id} (status {status})", file=sys.stderr)
+            print("  NOTE: this is the DRAFT edition — the API cannot query published "
+                  "versions. If the store has unpublished edits, the ASINs below are "
+                  "the staged set, not what shoppers see today.", file=sys.stderr)
+        else:
+            print("publish version: none returned; querying pages without one",
+                  file=sys.stderr)
     except AdsApiError as exc:
         print(f"publish-version lookup failed, continuing without it:\n{exc}", file=sys.stderr)
 
